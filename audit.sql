@@ -50,7 +50,7 @@ action TEXT NOT NULL CHECK (action IN ('I', 'D', 'U', 'T')),
 row_data jsonb,
 changed_fields jsonb,
 statement_only boolean not null,
-row_id bigint
+row_id text
 );
 REVOKE ALL ON audit.logged_actions
 FROM public;
@@ -72,6 +72,7 @@ COMMENT ON COLUMN audit.logged_actions.action IS 'Action type; I = insert, D = d
 COMMENT ON COLUMN audit.logged_actions.row_data IS 'Record value. Null for statement-level trigger. For INSERT this is the new tuple. For DELETE and UPDATE it is the old tuple.';
 COMMENT ON COLUMN audit.logged_actions.changed_fields IS 'New values of fields changed by UPDATE. Null except for row-level UPDATE events.';
 COMMENT ON COLUMN audit.logged_actions.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
+COMMENT ON COLUMN audit.logged_actions.row_id IS 'PK ID of the row';
 CREATE INDEX logged_actions_relid_idx ON audit.logged_actions(relid);
 CREATE INDEX logged_actions_action_tstamp_tx_stm_idx ON audit.logged_actions(action_tstamp_stm);
 CREATE INDEX logged_actions_action_idx ON audit.logged_actions(action);
@@ -83,8 +84,47 @@ DECLARE
     h_old jsonb;
     h_new jsonb;
     excluded_cols text [] = ARRAY []::text [];
+    pk_value text DEFAULT NULL;  -- Initialize pk_value
+    composite_key_value text DEFAULT NULL;
+    pk_col_names text[] = ARRAY[]::text[];
+    pk_col_name text;  -- Variable for individual column name
+    i integer;  -- Loop counter
     BEGIN IF TG_WHEN <> 'AFTER' THEN RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
 END IF;
+
+-- Get the primary key column names for the table
+    SELECT array_agg(a.attname)
+    INTO pk_col_names
+    FROM pg_index i
+    JOIN pg_attribute a ON a.attrelid = i.indrelid
+                         AND a.attnum = ANY(i.indkey)
+    WHERE i.indrelid = (TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME)::regclass
+      AND i.indisprimary;
+
+    -- If no primary key columns found
+    IF pk_col_names IS NULL OR array_length(pk_col_names, 1) = 0 THEN
+        RAISE NOTICE 'No primary key found for table %', TG_TABLE_NAME;
+    END IF;
+
+    IF array_length(pk_col_names, 1) > 0 THEN
+		composite_key_value = '';
+        -- Loop over the primary key columns and extract values
+        FOR i IN 1..array_length(pk_col_names, 1) LOOP
+            pk_col_name := pk_col_names[i];
+            -- Dynamically fetch the value of the primary key column for the OLD row
+            EXECUTE format('SELECT $1.%I', pk_col_name) INTO pk_value USING OLD;
+            IF pk_value IS NULL THEN
+                EXECUTE format('SELECT $1.%I', pk_col_name) INTO pk_value USING NEW;
+            END IF;
+            -- Concatenate the value to form the composite key
+            IF pk_value IS NOT NULL THEN
+                composite_key_value := composite_key_value || pk_value;
+            ELSE
+                composite_key_value := composite_key_value || '';
+            END IF;
+        END LOOP;
+    END IF;
+
 audit_row = ROW(
     nextval('audit.logged_actions_event_id_seq'),
     -- event_id
@@ -118,7 +158,7 @@ audit_row = ROW(
     NULL,
     -- row_data, changed_fields
     'f', -- statement_only,
-    COALESCE(OLD.id, NULL) -- pk ID of the row
+    composite_key_value -- pk ID of the row
 );
 IF NOT TG_ARGV [0]::boolean IS DISTINCT
 FROM 'f'::boolean THEN audit_row.client_query = NULL;
